@@ -93,9 +93,13 @@ CSM processes both text and audio tokens together. Each timestep has 33 dimensio
 - 1 dimension for text tokens
 
 ```python
-# From generator.py line 65-68
+# From generator.py lines 65-68 (text) and 88-91 (audio)
+# Text tokenization:
 text_frame = torch.zeros(len(text_tokens), 33).long()
 text_frame[:, -1] = torch.tensor(text_tokens)  # Text in last column
+
+# Audio tokenization:
+audio_frame = torch.zeros(audio_tokens.size(1), 33).long()
 audio_frame[:, :-1] = audio_tokens.transpose(0, 1)  # Audio in first 32 columns
 ```
 
@@ -115,11 +119,12 @@ Step 3: Process "Sesame" → Use cached K,V, only compute new token
 
 **In CSM:**
 ```python
-# From models.py line 120-127
+# From models.py lines 120-127
 def setup_caches(self, max_batch_size: int):
     """Setup KV caches for efficient inference."""
     self.backbone.setup_caches(max_batch_size, dtype)
-    self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=32)
+    self.decoder.setup_caches(max_batch_size, dtype, 
+                              decoder_max_seq_len=self.config.audio_num_codebooks)
 ```
 
 - `setup_caches()`: Allocates memory for caching before generation
@@ -253,12 +258,17 @@ The decoder's job is more focused: given the backbone's decision about "what to 
 The decoder generates codebooks sequentially: c1 depends on c0, c2 depends on c0 and c1, etc. This allows fine-grained control over audio quality.
 
 ```python
-# From models.py line 171-183
-for i in range(1, 32):  # Generate codebooks 1-31
-    decoder_h = self.decoder(self.projection(curr_h), ...)
+# From models.py lines 171-182
+for i in range(1, self.config.audio_num_codebooks):  # Generate codebooks 1-31
+    curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
+    decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, 
+                             mask=curr_decoder_mask).to(dtype=dtype)
     ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
     ci_sample = sample_topk(ci_logits, topk, temperature)
-    # ... continue with next codebook
+    ci_embed = self._embed_audio(i, ci_sample)
+    curr_h = ci_embed  # Feed into next codebook
+    curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
+    curr_pos = curr_pos[:, -1:] + 1
 ```
 
 #### 3. Projection Layer
@@ -370,7 +380,7 @@ The model generates audio frame-by-frame (each frame ≈ 80ms). For each frame:
 
 **5a. Generate Codebook 0 (from backbone):**
 ```python
-# From models.py line 160-163
+# From models.py lines 160-162
 last_h = h[:, -1, :]  # Last position's hidden state
 c0_logits = self.codebook0_head(last_h)
 c0_sample = sample_topk(c0_logits, topk, temperature)
@@ -378,15 +388,18 @@ c0_sample = sample_topk(c0_logits, topk, temperature)
 
 **5b. Generate Codebooks 1-31 (from decoder):**
 ```python
-# From models.py line 171-183
+# From models.py lines 170-182
 self.decoder.reset_caches()  # Fresh start for each frame
-for i in range(1, 32):
-    decoder_h = self.decoder(self.projection(curr_h), ...)
+for i in range(1, self.config.audio_num_codebooks):  # 1 to 31
+    curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
+    decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, 
+                             mask=curr_decoder_mask).to(dtype=dtype)
     ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
     ci_sample = sample_topk(ci_logits, topk, temperature)
     ci_embed = self._embed_audio(i, ci_sample)
     curr_h = ci_embed  # Feed into next codebook
     curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
+    curr_pos = curr_pos[:, -1:] + 1
 ```
 
 **Key points:**
