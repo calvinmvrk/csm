@@ -529,8 +529,9 @@ CSM leverages **Llama 3.2**, a state-of-the-art language model:
 
 **From Llama to Speech:**
 ```python
-# From models.py line 48-52
+# From models.py lines 48-52
 def _prepare_transformer(model):
+    embed_dim = model.tok_embeddings.embedding_dim
     model.tok_embeddings = nn.Identity()  # Replace with custom embeddings
     model.output = nn.Identity()          # Remove language modeling head
     return model, embed_dim
